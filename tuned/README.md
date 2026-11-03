@@ -83,6 +83,15 @@ cmake -C tuned/pgo-use-cache.cmake -S . -B build/pgo-use -G Ninja
 cmake --build build/pgo-use --target yuzu
 ```
 
+On Linux, use Clang 23, `lld`, and the same profile. Dependencies are listed in `docs/Deps.md`. Vulkan headers and Vulkan Utility Libraries have to be the same version, either both from the system or both bundled.
+
+```bash
+cmake -C tuned/pgo-use-linux.cmake -S . -B build/pgo-use-linux -G Ninja
+cmake --build build/pgo-use-linux --target yuzu
+```
+
+The binary is `build/pgo-use-linux/bin/eglantine`. `nx2_switches.txt` is copied next to it.
+
 To train your own profile, build with `tuned/pgo-gen-cache.cmake`, run with `LLVM_PROFILE_FILE` set, play for a while, then merge the output with `llvm-profdata merge -o tuned/eglantine.profdata`. A profile trained on your own games and CPU should suit you better than the one included here.
 
 ## 30FPS PATCH

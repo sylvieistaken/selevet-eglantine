@@ -8,6 +8,8 @@
 /[Bb]uild*/
 doc-build/
 out/
+!src/audio_core/out/
+!src/audio_core/out/**
 AppDir/
 uruntime
 

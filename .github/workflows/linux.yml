@@ -1,0 +1,238 @@
+name: linux
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PGO_LLVM_VERSION: "23"
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-x86_64-pgo
+            runner: ubuntu-24.04
+            pgo: true
+            tuned: true
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: linux-aarch64-pgo
+            runner: ubuntu-24.04-arm
+            pgo: true
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache file \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: ${{ runner.arch == 'ARM64' && 'linux_arm64' || 'linux' }}
+          target: desktop
+          arch: ${{ runner.arch == 'ARM64' && 'linux_gcc_arm64' || 'linux_gcc_64' }}
+          modules: qtcharts
+          cache: true
+
+      - name: Install clang for PGO
+        if: matrix.pgo
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$PGO_LLVM_VERSION main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "clang-$PGO_LLVM_VERSION" "lld-$PGO_LLVM_VERSION"
+          "clang-$PGO_LLVM_VERSION" --version
+
+      - name: Cache CPM downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-${{ matrix.platform }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: cpm-${{ matrix.platform }}-
+
+      - name: Cache compiler objects
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.platform }}-
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          flags=(
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_TESTING=OFF
+            -DYUZU_TESTS=OFF
+            -DYUZU_CMD=ON
+            -DYUZU_ROOM=OFF
+            -DYUZU_ROOM_STANDALONE=OFF
+            -DYUZU_USE_BUNDLED_QT=OFF
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
+            -DYUZU_USE_BUNDLED_SDL3=ON
+            -DVulkanHeaders_FORCE_BUNDLED=ON
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+            -DENABLE_UPDATE_CHECKER=OFF
+            -DUSE_DISCORD_PRESENCE=OFF
+            -DUSE_CCACHE=ON
+          )
+          if [ "${{ matrix.pgo }}" = "true" ]; then
+            profile="-fprofile-use=$GITHUB_WORKSPACE/tuned/eglantine.profdata -Wno-backend-plugin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+            if [ "${{ matrix.tuned }}" = "true" ]; then
+              profile="-march=x86-64-v3 -mtune=generic $profile"
+            fi
+            flags+=(
+              "-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION"
+              "-DCMAKE_CXX_COMPILER=clang++-$PGO_LLVM_VERSION"
+              "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$PGO_LLVM_VERSION/bin -fuse-ld=lld"
+              "-DCMAKE_C_FLAGS=$profile"
+              "-DCMAKE_CXX_FLAGS=$profile"
+            )
+          fi
+          cmake -S . -B build/release -G Ninja "${flags[@]}"
+
+      - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 3000M
+          LLVM_PARALLEL_LINK_JOBS: "1"
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          ccache --show-stats
+
+      - name: Package tar.gz
+        run: |
+          set -euo pipefail
+          test -x build/release/bin/eglantine
+          test -x build/release/bin/eden-cli
+          stage="$RUNNER_TEMP/tar-stage"
+          mkdir -p "$stage"
+          cp build/release/bin/eglantine build/release/bin/eden-cli tuned/nx2_switches.txt "$stage/"
+          if [ -x "/usr/lib/llvm-$PGO_LLVM_VERSION/bin/llvm-strip" ]; then
+            "/usr/lib/llvm-$PGO_LLVM_VERSION/bin/llvm-strip" "$stage/eglantine" "$stage/eden-cli"
+          else
+            strip "$stage/eglantine" "$stage/eden-cli"
+          fi
+          tar -czf "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" -C "$stage" \
+            eglantine eden-cli nx2_switches.txt
+
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          test -x build/release/bin/eglantine
+          test -x build/release/bin/eden-cli
+          arch=$(uname -m)
+          tools="$RUNNER_TEMP/linuxdeploy"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/linuxdeploy-$arch.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+          curl -fsSL -o "$tools/linuxdeploy-plugin-qt-$arch.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage"
+          curl -fsSL -o "$tools/appimagetool-$arch.AppImage" \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$arch.AppImage"
+          chmod +x "$tools"/*.AppImage
+          icon="$RUNNER_TEMP/dev.eglantine.eglantine.png"
+          cp dist/Eglantine.png "$icon"
+          cat > "$RUNNER_TEMP/AppRun" << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/eglantine" "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/AppRun"
+          export PATH="$tools:$PATH"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export ARCH="$arch"
+          export LDAI_OUTPUT="eglantine-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
+          "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
+            --executable build/release/bin/eglantine \
+            --executable build/release/bin/eden-cli \
+            --desktop-file dist/dev.eden_emu.eden.desktop \
+            --icon-file "$icon" \
+            --custom-apprun "$RUNNER_TEMP/AppRun" \
+            --plugin qt
+          cp tuned/nx2_switches.txt AppDir/usr/bin/nx2_switches.txt
+          "$tools/appimagetool-$arch.AppImage" AppDir "$LDAI_OUTPUT"
+          test -s "$LDAI_OUTPUT"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            eglantine-${{ github.sha }}-${{ matrix.platform }}.tar.gz
+            eglantine-${{ github.sha }}-${{ matrix.platform }}.AppImage
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish Linux release
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: eglantine-*-${{ github.sha }}
+          path: artifacts
+
+      - name: Collect files
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp artifacts/*/*.AppImage artifacts/*/*.tar.gz dist/
+          ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "linux-${GITHUB_SHA::7}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --prerelease \
+            --title "Eglantine Linux ${GITHUB_SHA::7}" \
+            --notes "Linux builds of ${GITHUB_SHA}.
+
+          AppImage: chmod +x, then run it. Bundles Qt and the other libraries. Needs glibc 2.39 or newer.
+          tar.gz: extract and run ./eglantine or ./eden-cli. Uses system Qt 6 and the usual libraries. nx2_switches.txt sits next to the programs.
+          The -pgo files are compiled with tuned/eglantine.profdata. linux-x86_64-pgo also targets x86-64-v3."

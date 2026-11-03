@@ -2801,7 +2801,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
         case 0x94d: { // EXIT
             if (geometry_exit && index * sizeof(Instruction) < geometry_exit->handler) {
                 relocations.push_back({static_cast<u32>(result.instructions.size()),
-                                       geometry_exit->handler / sizeof(Instruction)});
+                                       static_cast<s64>(geometry_exit->handler / sizeof(Instruction))});
                 emit(0xe24000000000000fULL | predicate);
                 break;
             }
