@@ -1906,10 +1906,13 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const auto& process = Kernel::GetCurrentProcess(kernel);
+        const auto* const process = system.ApplicationProcess();
+        // The present can arrive from a service context whose current process is not the game,
+        // and the loader patched the application process: asking for the current one meant the
+        // title never matched, so mkw_dynamic_fps silently did nothing.
         const bool mkw_dynamic =
-            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
+            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
         // Mario Kart World flips between intervals 1 and 2 every few frames (its own frame timing
         // on a VRR display): held to two vblanks on each 2, it fell from ~40 to 20-30 fps. Honour
         // an interval above 1 only once the game has kept it for StableSwapPresents presents.
@@ -1927,7 +1930,8 @@ private:
             return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
         }();
         const bool follow = follow_env == 1 ||
-                            (follow_env == -1 && process.GetProgramId() == Settings::DonkeyKongBananzaProgramId);
+                            (follow_env == -1 && process != nullptr &&
+                             process->GetProgramId() == Settings::DonkeyKongBananzaProgramId);
         if (follow) {
             swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         }
