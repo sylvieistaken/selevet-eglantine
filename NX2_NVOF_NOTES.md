@@ -1,28 +1,28 @@
 # NVIDIA Optical Flow frame generation (NX2)
 
-Terzo backend di frame generation, accanto a Lossless Scaling (LSFG) e FSR 3.
-Usa l'Optical Flow Accelerator hardware delle GPU NVIDIA RTX tramite `VK_NV_optical_flow`.
-Non usa DLL: il DLSS Frame Generation (`nvngx_dlssg.dll`) richiede motion vector e depth
-del motore di gioco, che un emulatore non ha.
+A third frame generation backend, alongside Lossless Scaling (LSFG) and FSR 3.
+It uses the hardware Optical Flow Accelerator on NVIDIA RTX GPUs through `VK_NV_optical_flow`.
+It does not use any DLLs: DLSS Frame Generation (`nvngx_dlssg.dll`) requires motion vectors and depth
+from the game engine, which an emulator does not have.
 
-## Come si attiva
-Configurazione > Graphics > Frame Generation Type > "NVIDIA Optical Flow (RTX 20+)".
-Se la GPU/driver non lo supporta, o se qualcosa fallisce, il programma passa a FSR 3
-e lo scrive nel log (`Render_Vulkan`).
+## How to enable it
+Configuration > Graphics > Frame Generation Type > "NVIDIA Optical Flow (RTX 20+)".
+If the GPU/driver doesn't support it, or if anything fails, the program falls back to FSR 3
+and writes this to the log (`Render_Vulkan`).
 
-## Come funziona
-1. Il frame presentato viene copiato in una di due immagini (ping-pong).
-2. L'acceleratore calcola il flusso tra frame nuovo e precedente su una coda dedicata
-   (`VK_QUEUE_OPTICAL_FLOW_BIT_NV`), poi si aspetta la fine con una fence.
-3. Il flusso (S10.5) viene copiato in un buffer e convertito da `nv_optical_flow_convert.comp`
-   in un'immagine R16G16_SFLOAT in pixel.
-4. I frame generati usano lo stesso shader di interpolazione di FSR 3.
+## How it works
+1. The presented frame is copied into one of two images (ping-pong).
+2. The accelerator computes the flow between the new and previous frame on a dedicated queue
+   (`VK_QUEUE_OPTICAL_FLOW_BIT_NV`), then waits for completion with a fence.
+3. The flow (S10.5) is copied into a buffer and converted by `nv_optical_flow_convert.comp`
+   into an R16G16_SFLOAT image, in pixels.
+4. Generated frames use the same interpolation shader as FSR 3.
 
-## Note
-- Mai provato su hardware: e' stato controllato solo che compili e che lo shader sia valido.
-- Se i frame generati sembrano andare "all'indietro", avvia con la variabile d'ambiente
-  `EDEN_NVOF_INVERT=1` (inverte il segno del flusso).
-- Ogni frame fa una `scheduler.Finish()` per sincronizzare la coda dell'optical flow:
-  semplice e sicuro, ma costa un po' di parallelismo CPU/GPU.
-- Righe di log da cercare: "NVIDIA optical flow frame generation ready", "Optical flow queue family",
+## Notes
+- Never tested on real hardware: it has only been checked that it compiles and that the shader is valid.
+- If generated frames appear to move "backwards", launch with the environment variable
+  `EDEN_NVOF_INVERT=1` (this inverts the sign of the flow).
+- Every frame calls `scheduler.Finish()` to synchronize the optical flow queue:
+  simple and safe, but it costs some CPU/GPU parallelism.
+- Log lines to look for: "NVIDIA optical flow frame generation ready", "Optical flow queue family",
   "failed:".
