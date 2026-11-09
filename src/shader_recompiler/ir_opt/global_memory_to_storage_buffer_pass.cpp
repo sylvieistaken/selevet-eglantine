@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <chrono>
 #include <deque>
 #include <map>
 #include <optional>
@@ -19,9 +18,8 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
-#include "common/logging.h"
-#include "common/scope_exit.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -68,7 +66,6 @@ struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
     StorageWritesSet writes;
-    StorageWritesSet rebased_writes;
     /// Constant buffer words that step strided iterators, see CollectIteratorWords
     StorageBufferSet iterator_words;
     /// Constant buffer pointers a global atomic uses as its address, see CollectAtomicPointers
@@ -83,6 +80,11 @@ struct StorageInfo {
     std::unordered_set<const IR::Inst*> native_dynamic;
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
+    /// Paired accesses bind the loaded pointers that compete with their pair; cleared when those
+    /// leave too few bindings.
+    bool bind_competing_loaded{true};
+    /// A paired access bound the loaded pointers that compete with its pair.
+    bool competing_loaded_bound{};
     /// Pointer table entries reached through a phi or select of table pointers, or through a
     /// table pointer read from a dynamically indexed constant buffer array. They are bound only
     /// in the bindings the program's other storage buffers leave free (table_budget).
@@ -90,6 +92,9 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// The storage buffers the pass without table entries bound; bound again, they take nothing
+    /// from table_budget, which they were left out of.
+    StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
 };
 
@@ -121,6 +126,7 @@ bool IsGlobalMemory(const IR::Inst& inst) {
     case IR::Opcode::GlobalAtomicOr32:
     case IR::Opcode::GlobalAtomicXor32:
     case IR::Opcode::GlobalAtomicExchange32:
+    case IR::Opcode::GlobalAtomicCompareExchange32:
     case IR::Opcode::GlobalAtomicIAdd64:
     case IR::Opcode::GlobalAtomicSMin64:
     case IR::Opcode::GlobalAtomicUMin64:
@@ -152,6 +158,24 @@ bool IsGlobalMemory(const IR::Inst& inst) {
     }
 }
 
+/// Returns true when the backend can pick a global access's buffer among the bound ones at run time
+bool IsRuntimeRoutable(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadGlobal32:
+    case IR::Opcode::LoadGlobal64:
+    case IR::Opcode::LoadGlobal128:
+    case IR::Opcode::WriteGlobal32:
+    case IR::Opcode::WriteGlobal64:
+    case IR::Opcode::WriteGlobal128:
+    case IR::Opcode::GlobalAtomicIAdd32:
+    case IR::Opcode::GlobalAtomicUMax32:
+    case IR::Opcode::GlobalAtomicCompareExchange32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// Returns true when the instruction is a global memory instruction
 bool IsGlobalMemoryWrite(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
@@ -173,6 +197,7 @@ bool IsGlobalMemoryWrite(const IR::Inst& inst) {
     case IR::Opcode::GlobalAtomicOr32:
     case IR::Opcode::GlobalAtomicXor32:
     case IR::Opcode::GlobalAtomicExchange32:
+    case IR::Opcode::GlobalAtomicCompareExchange32:
     case IR::Opcode::GlobalAtomicIAdd64:
     case IR::Opcode::GlobalAtomicSMin64:
     case IR::Opcode::GlobalAtomicUMin64:
@@ -257,6 +282,8 @@ IR::Opcode GlobalToStorage(IR::Opcode opcode) {
         return IR::Opcode::StorageAtomicXor32;
     case IR::Opcode::GlobalAtomicExchange32:
         return IR::Opcode::StorageAtomicExchange32;
+    case IR::Opcode::GlobalAtomicCompareExchange32:
+        return IR::Opcode::StorageAtomicCompareExchange32;
     case IR::Opcode::GlobalAtomicIAdd64:
         return IR::Opcode::StorageAtomicIAdd64;
     case IR::Opcode::GlobalAtomicSMin64:
@@ -472,15 +499,7 @@ struct TrackingConditions {
         IR::Block* merge;
     };
     std::unordered_map<const IR::Inst*, IR::Block*> owners;
-    // The If scopes enclosing each block, as a tree: each block keeps the index of its innermost
-    // scope and each scope its parent's. Copying the whole stack for every block took up to
-    // 200 ms on Kirby Air Riders' 3000-block compute programs.
-    struct ScopeNode {
-        Scope scope;
-        s32 parent;
-    };
-    std::vector<ScopeNode> scope_nodes;
-    std::unordered_map<IR::Block*, s32> scopes;
+    std::unordered_map<IR::Block*, std::vector<Scope>> scopes;
     std::unordered_map<IR::Block*, std::vector<Scope>> merges;
     std::unordered_map<IR::Block*, IR::Block*> loops;
     IR::Block* current{};
@@ -495,7 +514,7 @@ struct TrackingConditions {
                 }
             }
         }
-        s32 active = -1; // Innermost enclosing scope, an index into scope_nodes
+        std::vector<Scope> active;
         std::vector<IR::Block*> loop_stack;
         IR::Block* previous{};
         for (const auto& node : program.syntax_list) {
@@ -510,12 +529,11 @@ struct TrackingConditions {
                 const Scope scope{Literal(node.data.if_node.cond), previous,
                                   node.data.if_node.merge};
                 merges[scope.merge].push_back(scope);
-                scope_nodes.push_back({scope, active});
-                active = static_cast<s32>(scope_nodes.size() - 1);
+                active.push_back(scope);
                 break;
             }
             case IR::AbstractSyntaxNode::Type::EndIf:
-                active = scope_nodes[active].parent;
+                active.pop_back();
                 break;
             case IR::AbstractSyntaxNode::Type::Loop:
                 loop_stack.push_back(node.data.loop.body);
@@ -719,8 +737,8 @@ struct TrackingConditions {
         }
         for (const auto& branch : merge->second) {
             const auto [condition, positive] = branch.condition;
-            for (s32 node = current_scopes->second; node >= 0; node = scope_nodes[node].parent) {
-                const auto [known_condition, known_positive] = scope_nodes[node].scope.condition;
+            for (const auto& known : current_scopes->second) {
+                const auto [known_condition, known_positive] = known.condition;
                 if (condition != known_condition) {
                     continue;
                 }
@@ -1133,7 +1151,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find_if(candidates, [&](const StorageBufferAddr& entry) { return entry == pointer; }) == candidates.end() &&
+                            std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) == candidates.end() &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
@@ -1147,7 +1165,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             }
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
             if (Common::IsAligned(pointer.offset, 8) &&
-                std::ranges::find_if(candidates, [&](const StorageBufferAddr& entry) { return entry == pointer; }) == candidates.end() &&
+                std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) == candidates.end() &&
                 env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                 candidates.push_back(pointer);
             }
@@ -1210,7 +1228,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find_if(candidates, [&](const StorageBufferAddr& entry) { return entry == pointer; }) != candidates.end()) {
+                if (std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) != candidates.end()) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
@@ -1223,7 +1241,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     if (!info.tables_enabled) {
                         return;
                     }
-                    if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& entry) { return entry == pointer; }) ==
+                    if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) ==
                         info.table_candidates.end()) {
                         info.table_candidates.push_back(pointer);
                     }
@@ -1327,7 +1345,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
         storage_buffer.reset();
     }
-    if (native && !storage_buffer && !low_addr.IsImmediate()) {
+    // A paired constant buffer pointer can be only one input of a select or phi whose other input
+    // is a pointer loaded from that buffer (Ocarina of Time's foliage unit placement records are
+    // read from c0[12] or from *c0[12]). Rebasing on the constant buffer pointer then reads the
+    // loaded path's records out of bounds, as zeros, so look for loaded pointers here as well.
+    const bool paired_found = storage_buffer.has_value();
+    if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
@@ -1340,20 +1363,37 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             }
         }
         const auto& candidates{it->second};
-        if (candidates.size() > 1 || (!candidates.empty() && info.native_dynamic.contains(start))) {
+        const bool has_loaded_pointer{std::ranges::any_of(
+            candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
+        if (paired_found &&
+            (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
+            // No pointer loaded from memory competes with the paired one, or the access cannot
+            // stay global: keep the pair.
+        } else if (candidates.size() > 1 || paired_found ||
+                   (!candidates.empty() && info.native_dynamic.contains(start))) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
+            if (paired_found) {
+                // The paired pointer is the other input of the select or phi; bind it too.
+                info.competing_loaded_bound = true;
+                info.set.insert(*storage_buffer);
+                if (IsGlobalMemoryWrite(inst)) {
+                    info.writes.insert(*storage_buffer);
+                }
+            }
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& entry) { return entry == candidate; }) !=
+                if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& e) { return e == candidate; }) !=
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
+                    const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
+                        return info.set.find(buffer) == info.set.end() &&
+                               !info.counted.contains(buffer);
+                    };
                     const size_t added{
-                        (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
-                        (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
-                             ? 1U
-                             : 0U)};
+                        (takes_binding(candidate) ? 1U : 0U) +
+                        (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
                         continue;
                     }
@@ -1375,7 +1415,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 return;
             }
             // Only table entries, and no free binding for them: as if none had been found.
-        } else if (candidates.size() == 1) {
+        } else if (candidates.size() == 1 && !paired_found) {
             // The one pointer the address is built from. The NVN search below only takes 16-byte
             // aligned slots, so for a pointer at an 8-byte slot it can return a dimension or stride
             // the address arithmetic reads instead, and the access then lands in the wrong buffer.
@@ -1427,7 +1467,6 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     // Collect storage buffer and the instruction
     if (IsGlobalMemoryWrite(inst)) {
         info.writes.insert(*storage_buffer);
-        info.rebased_writes.insert(*storage_buffer);
     }
     info.set.insert(*storage_buffer);
     info.to_replace.push_back(StorageInst{
@@ -1484,6 +1523,16 @@ void ReplaceAtomic(IR::Block& block, IR::Inst& inst, const IR::U32& storage_inde
     const auto it{IR::Block::InstructionList::s_iterator_to(inst)};
     const IR::Value value{
         &*block.PrependNewInst(it, new_opcode, {storage_index, offset, inst.Arg(1)})};
+    inst.ReplaceUsesWith(value);
+}
+
+/// Replace a global compare-exchange with its storage buffer equivalent, keeping both operands
+void ReplaceAtomicCompareExchange(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
+                                  const IR::U32& offset) {
+    const IR::Opcode new_opcode{GlobalToStorage(inst.GetOpcode())};
+    const auto it{IR::Block::InstructionList::s_iterator_to(inst)};
+    const IR::Value value{&*block.PrependNewInst(
+        it, new_opcode, {storage_index, offset, inst.Arg(1), inst.Arg(2)})};
     inst.ReplaceUsesWith(value);
 }
 
@@ -1544,6 +1593,8 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
     case IR::Opcode::GlobalAtomicMaxF16x2:
     case IR::Opcode::GlobalAtomicMaxF32x2:
         return ReplaceAtomic(block, inst, storage_index, offset);
+    case IR::Opcode::GlobalAtomicCompareExchange32:
+        return ReplaceAtomicCompareExchange(block, inst, storage_index, offset);
     default:
         throw InvalidArgument("Invalid global memory opcode {}", inst.GetOpcode());
     }
@@ -1559,55 +1610,56 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
-    // Where a slow run of this pass spends its time (logged when it takes over 50 ms).
-    auto part_begin = std::chrono::steady_clock::now();
-    std::array<double, 5> part_ms{};
-    const auto end_part = [&](size_t part) {
-        const auto now = std::chrono::steady_clock::now();
-        part_ms[part] = std::chrono::duration<double, std::milli>(now - part_begin).count();
-        part_begin = now;
-    };
+    const size_t max_ssbos{StorageBufferLimit(host_info)};
     TrackingConditions conditions{program};
-    end_part(0);
     StorageInfo info;
+    // Without 64-bit integers the backend cannot route global accesses among bound buffers.
+    info.bind_competing_loaded = host_info.support_int64;
     info.iterator_words = CollectIteratorWords(program);
-    end_part(1);
     info.atomic_pointers = CollectAtomicPointers(program);
-    end_part(2);
-    size_t accesses = 0;
     const auto collect = [&] {
         for (IR::Block* const block : program.post_order_blocks) {
             for (IR::Inst& inst : block->Instructions()) {
                 if (!IsGlobalMemory(inst)) {
                     continue;
                 }
-                ++accesses;
                 conditions.current = block;
                 CollectStorageBuffers(*block, inst, info, env, conditions);
             }
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
-        // Again with pointer table entries, in the bindings the first pass left free.
-        StorageInfo with_tables;
-        with_tables.iterator_words = std::move(info.iterator_words);
-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
-        with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_tables);
+    if (info.competing_loaded_bound && info.set.size() > max_ssbos) {
+        // Not enough bindings for the loaded pointers that compete with paired ones: keep the
+        // pairs, as if no loaded pointer competed.
+        StorageInfo paired;
+        paired.iterator_words = std::move(info.iterator_words);
+        paired.atomic_pointers = std::move(info.atomic_pointers);
+        paired.bind_competing_loaded = false;
+        info = std::move(paired);
         collect();
     }
-    end_part(3);
-    SCOPE_EXIT {
-        end_part(4);
-        if (part_ms[0] + part_ms[1] + part_ms[2] + part_ms[3] + part_ms[4] > 50.0) {
-            LOG_INFO(Shader,
-                     "Slow storage buffer pass: conditions {:.1f}, iterator words {:.1f}, atomic "
-                     "pointers {:.1f}, accesses {:.1f} ({} of them), replace {:.1f} ms",
-                     part_ms[0], part_ms[1], part_ms[2], part_ms[3], accesses, part_ms[4]);
+    if (info.tables_seen && info.set.size() < max_ssbos) {
+        // Again with pointer table entries, in the bindings the first pass left free.
+        StorageInfo with_tables;
+        with_tables.iterator_words = info.iterator_words;
+        with_tables.atomic_pointers = info.atomic_pointers;
+        with_tables.bind_competing_loaded = info.bind_competing_loaded;
+        with_tables.tables_enabled = true;
+        with_tables.table_budget = max_ssbos - info.set.size();
+        with_tables.counted = info.set;
+        std::swap(info, with_tables);
+        collect();
+        if (info.set.size() > max_ssbos) {
+            // Never more storage buffers than a stage binds: without the table entries, then.
+            info = std::move(with_tables);
         }
-    };
+    }
+    if (info.set.size() > max_ssbos) {
+        // Binding only some of them would drop the accesses through the others.
+        throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                      info.set.size(), max_ssbos);
+    }
     program.info.native_global_bounds |= info.native_runtime_bounds;
     for (const StorageBufferAddr& storage_buffer : info.set) {
         program.info.storage_buffers_descriptors.push_back({
@@ -1616,7 +1668,6 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .count = 1,
             .is_written = info.writes.contains(storage_buffer),
             .indirect_offset = storage_buffer.indirect,
-            .rebased_writes = info.rebased_writes.contains(storage_buffer),
         });
     }
     for (const StorageInst& storage_inst : info.to_replace) {
@@ -1631,7 +1682,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
 }
 
-void JoinStorageInfo(Info& base, Info& source) {
+size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
+    size_t limit{Info::MAX_SSBOS};
+    for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
+                                   host_info.max_descriptor_set_storage_buffers}) {
+        if (device_limit != 0) {
+            limit = (std::min)(limit, size_t{device_limit});
+        }
+    }
+    return limit;
+}
+
+void JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
@@ -1643,8 +1705,11 @@ void JoinStorageInfo(Info& base, Info& source) {
         })};
         if (it != descriptors.end()) {
             it->is_written |= desc.is_written;
-            it->rebased_writes |= desc.rebased_writes;
             continue;
+        }
+        if (descriptors.size() >= limit) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descriptors.size() + 1, limit);
         }
         descriptors.push_back(desc);
     }

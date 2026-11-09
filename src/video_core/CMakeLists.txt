@@ -62,6 +62,8 @@ add_library(video_core STATIC
     engines/puller.h
     framebuffer_config.cpp
     framebuffer_config.h
+    frametime_log.cpp
+    frametime_log.h
     render_trace.h
     fsr.cpp
     fsr.h
@@ -114,11 +116,10 @@ add_library(video_core STATIC
     native_query_trace.h
     nx2.h
     nx2_cmdpage_diag.h
-    nx2_frame_skip.h
-    nx2_draw_runs.h
-    nx2_clean_pages.h
-    nx2_fast_draw.h
+    nx2_debug_control.cpp
+    nx2_debug_control.h
     nx2_profile.h
+    pending_maps.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -187,6 +188,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
+    renderer_vulkan/vk_cooperative_hmma_test.cpp
+    renderer_vulkan/vk_cooperative_hmma_test.h
     renderer_vulkan/vk_descriptor_buffer.cpp
     renderer_vulkan/vk_descriptor_buffer.h
     renderer_vulkan/vk_descriptor_pool.cpp
@@ -199,10 +202,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_graphics_pipeline.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
+    renderer_vulkan/vk_gpu_breadcrumbs.cpp
+    renderer_vulkan/vk_gpu_breadcrumbs.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
-    renderer_vulkan/vk_parallel_record.cpp
-    renderer_vulkan/vk_parallel_record.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_present_manager.cpp

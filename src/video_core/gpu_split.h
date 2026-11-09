@@ -3,16 +3,29 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "common/common_types.h"
-#include "video_core/engines/engine_interface.h"
+
+namespace Core {
+class System;
+}
+
+namespace Tegra::Engines {
+class EngineInterface;
+}
 
 namespace VideoCommon {
 
@@ -32,14 +45,13 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
-    MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
+    "gp sync fence", "map",           "front start", "front verify",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -64,6 +76,42 @@ public:
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
+    }
+
+    /// EDEN_NX2_MACRO_SINK (on unless =0): the state writes the front's 3D macros make
+    /// (registers outside execution_mask) go to the back's method sink like the command list's
+    /// own state writes, instead of one CallMethod each; the back applies its sink, in order,
+    /// before the engine's next executable method.
+    [[nodiscard]] static bool MacroSink() {
+        return macro_sink;
+    }
+    /// EDEN_NX2_COMPUTE_SINK (on unless =0): native compute writes that only store their value
+    /// (native_plain_methods), from macros or the command list, are dropped when the front's
+    /// register copy shows the back holds the value already, else sent batched (SinkMethod).
+    [[nodiscard]] static bool ComputeSink() {
+        return compute_sink;
+    }
+    /// EDEN_NX2_RING_PAIRS (on unless =0): the state writes that would go to the back's method
+    /// sink (the command list's 3D state writes; the 3D macros' with EDEN_NX2_MACRO_SINK, the
+    /// compute ones with EDEN_NX2_COMPUTE_SINK) go as (method, value) pairs in Pairs blocks
+    /// (PairWrite), which the back applies in one loop per block (EngineInterface::ApplyPairs),
+    /// after its method sink.
+    [[nodiscard]] static bool RingPairs() {
+        return ring_pairs;
+    }
+
+    /// The front's writes that took a batched path (EDEN_NX2_MACRO_SINK, EDEN_NX2_RING_PAIRS),
+    /// logged every 10 s.
+    enum class Batched : u32 {
+        MacroSunk,   ///< 3D macro state writes sent to the method sink (or as pairs)
+        ComputeSunk, ///< Compute state writes sent to the method sink (or as pairs)
+        ComputeSame, ///< Compute state writes dropped: the register held the value
+        Pairs,       ///< Writes sent as pairs (any engine, any source)
+        PairBlocks,  ///< Pairs blocks opened
+        Count,
+    };
+    void CountBatched(Batched counter, u64 amount = 1) {
+        batched[static_cast<size_t>(counter)] += amount;
     }
 
     /// Whether the calling thread is the back.
@@ -105,9 +153,6 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
-        if (engine->memory_write_mask[method]) {
-            NoteMaskedWrite(engine, method);
-        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -118,47 +163,51 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
-        if (engine->memory_write_mask[method]) {
-            NoteMaskedWrite(engine, method);
+    }
+    /// EDEN_NX2_MACRO_SINK: a write that only stores a register's value, to an engine whose
+    /// execution_mask has the register (native compute): the back puts it in the engine's method
+    /// sink tagged EngineInterface::SplitPlainTag, applied before the engine's next other write.
+    void SinkMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Sink | (u64{method & 0xffff} << 8) |
+                   (u64{argument} << 32);
+        Commit(1);
+    }
+    /// EDEN_NX2_RING_PAIRS: a write that only stores a register's value (no execution_mask side
+    /// effect; native compute: native_plain_methods), appended to the open Pairs block. A block
+    /// is open only until anything else is reserved or the ring is published (Reserve, Publish),
+    /// so published entries never change and a block never crosses the ring's end.
+    void PairWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        const u64 pair = u64{method & 0xffff} | (u64{argument} << 32);
+        const size_t index = write_position & RingMask;
+        if (pairs_header != nullptr && index != 0 && pairs_count < MaxPairs &&
+            write_position + 1 - consumed_cache <= RingWords) [[likely]] {
+            ring[index] = pair;
+            ++pairs_count;
+            *pairs_header = static_cast<u64>(Kind::Pairs) | (u64{pairs_count} << 32);
+            CountBatched(Batched::Pairs);
+            Commit(1);
+            return;
         }
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::Pairs) | (u64{1} << 32);
+        entry[1] = pair;
+        pairs_header = entry;
+        pairs_count = 1;
+        CountBatched(Batched::Pairs);
+        CountBatched(Batched::PairBlocks);
+        Commit(2);
     }
-
-    /// EDEN_NX2_DMA_RANGES=1: the memory the next memory-writing method sent writes, in GPU
-    /// addresses (constant buffer and inline uploads, reports). Macro memory reads then wait for
-    /// those methods only when they overlap what the read covers.
-    void SetNextWriteRange(GPUVAddr begin, GPUVAddr end) {
-        next_range_begin = begin;
-        next_range_end = end;
-        next_write_kind = NextWrite::Range;
-    }
-    /// The next memory-writing method makes earlier draws' writes visible (wait for idle, sync
-    /// info) without writing memory itself.
-    void SetNextWriteVisibility() {
-        next_write_kind = NextWrite::Visibility;
-    }
-    [[nodiscard]] static bool RangesEnabled() {
-        return ranges_enabled;
-    }
-    /// Re-reads EDEN_NX2_DMA_RANGES and EDEN_NX2_LIST_TRUST (nx2_switches.txt loads after
-    /// static initialisation).
-    static void ReloadFromEnvironment();
-    /// EDEN_NX2_LIST_TRUST=1: command list entries on pages already seen to be CPU-written (no
-    /// compute or copy queued could have written them) don't wait for queued writers again.
-    [[nodiscard]] static bool ListTrustEnabled() {
-        return list_trust_enabled;
-    }
-
-    /// Defer flag: the call doesn't end EDEN_NX2_FAST_DRAW reuse (nx2_fast_draw.h).
-    static constexpr u64 FastDrawNeutral = 1 << 7;
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
-    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func, u64 flags = 0) {
+    void Defer(const Func& func) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
@@ -195,6 +244,85 @@ public:
     /// Returns whether any of it was still queued.
     bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
     bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
+    /// report, a semaphore release). size ~0 means an unknown range.
+    void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
+        PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+        write.what = what;
+        write.begin = begin;
+        write.end = size == ~u64{0} ? ~u64{0} : begin + size;
+        write.position = write_position;
+        write.words = 0;
+    }
+    /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
+    /// linear inline upload data): reads overlay them instead of waiting.
+    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        while (words != 0) {
+            const u32 count = (std::min<u32>)(words, PendingWriteWords);
+            PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
+            write.what = "known";
+            write.begin = begin;
+            write.end = begin + u64{count} * sizeof(u32);
+            write.position = write_position;
+            write.words = count;
+            std::memcpy(write.data.data(), data, count * sizeof(u32));
+            begin += u64{count} * sizeof(u32);
+            data += count;
+            words -= count;
+        }
+    }
+    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
+    [[nodiscard]] u64 ConsumedNow() {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// Applies to `out` (the words at device address `begin`, read from guest memory after
+    /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
+    /// overlapping queued write's words are unknown (the caller waits instead).
+    bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
+    /// Waits until the back executed the noted writes that overlap [begin, begin + size).
+    /// Returns false when more writes are queued than are remembered (the caller drains).
+    bool WaitForWritesTo(u64 begin, u64 size);
+    /// Whether a noted write that overlaps [begin, begin + size) is still queued (or too many
+    /// are queued to tell).
+    bool HasQueuedWritesTo(u64 begin, u64 size);
+    /// Front: a write that lands when a host query completes or a fence signals (counter
+    /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
+    void NoteAsyncWrite(u64 begin, u64 size) {
+        NoteReportWrite(begin, size);
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            async_writes[slot] = write_position;
+        }
+    }
+    /// Front: whether these bytes lie on 4 KiB pages reports or semaphore releases write (query
+    /// and semaphore pools), which draws and dispatches don't write.
+    [[nodiscard]] bool IsReportMemory(u64 begin, u64 size) const {
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            if (!report_pages.contains(page)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    /// Front: a report or semaphore release was sent to these bytes.
+    void NoteReportWrite(u64 begin, u64 size) {
+        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
+            report_pages.insert(page);
+        }
+    }
+    /// Front: the ring position of the newest async write noted to these bytes, or 0.
+    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
+        u64 newest = 0;
+        if (async_writes.empty()) {
+            return newest;
+        }
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            if (const auto it = async_writes.find(slot); it != async_writes.end()) {
+                newest = (std::max)(newest, it->second);
+            }
+        }
+        return newest;
+    }
+
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -204,89 +332,81 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
-    /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
-    void NoteMemoryWrite() {
-        last_memory_write_position = write_position;
-        last_untracked_write_position = write_position;
-    }
-    /// Deferred work that writes [begin, end) only (puller semaphore releases; payloads are
-    /// written at once while the split runs).
-    void NoteMemoryWriteRange(GPUVAddr begin, GPUVAddr end) {
-        last_memory_write_position = write_position;
-        if (ranges_enabled) {
-            RecordRange(begin, end);
-        } else {
-            last_untracked_write_position = write_position;
-        }
-    }
-    /// EDEN_NX2_PIN_FRONT / EDEN_NX2_PIN_BACK=<logical CPU>: pins the calling thread there (the GPU
-    /// thread and the split's back on separate physical cores, Windows only). `variable` names
-    /// the environment variable to read.
-    static void PinCurrentThread(const char* variable);
 
-    /// EDEN_NX2_ACQUIRE_QUEUED: a semaphore release with its payload, sent to the back.
-    void NoteQueuedRelease(GPUVAddr address, u32 payload) {
-        QueuedRelease& slot = queued_releases[queued_release_head];
-        slot = {address, payload, write_position};
-        queued_release_head = (queued_release_head + 1) % queued_releases.size();
+    /// Semaphore and report writes are tracked per 16-byte granule, tagged: an untagged 64-slot
+    /// hash made unrelated macro reads wait for the back (~250 ms a second in Ocarina).
+    static constexpr size_t SemSlot(u64 granule) noexcept {
+        return static_cast<size_t>((granule ^ (granule >> 10) ^ (granule >> 20)) & (SemSlots - 1));
     }
-    /// Whether a release still queued for the back writes `address` with a payload that `meets`
-    /// accepts: the back runs it before anything sent later, so an acquire of it needn't drain.
-    template <typename Meets>
-    [[nodiscard]] bool QueuedReleaseMeets(GPUVAddr address, Meets&& meets) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        // The newest release to the address decides (a later one can overwrite an earlier).
-        u64 best_position = 0;
-        bool found = false;
-        bool met = false;
-        for (const QueuedRelease& release : queued_releases) {
-            if (release.address == address && release.position > consumed_cache &&
-                release.position >= best_position) {
-                best_position = release.position;
-                found = true;
-                met = meets(release.payload);
-            }
+    /// `payload`: the value the write stores at `addr`, when the front knows it (a plain
+    /// release); `size`: the bytes it writes (16 with a timestamp, 4 for a one-word release).
+    void NoteSemaphoreWrite(u64 addr, std::optional<u32> payload = std::nullopt,
+                            u64 size = 16) noexcept {
+        const u64 granule = addr >> 4;
+        SemWrite& slot = sem_writes[SemSlot(granule)];
+        // Evicting a write the back has not run yet: later lookups can't see it, so wait for it.
+        if (slot.granule != granule && slot.position > consumed_cache) {
+            sem_evicted_position = std::max(sem_evicted_position, slot.position);
         }
-        return found && met;
-    }
-    /// Deferred work that writes no memory itself but orders earlier GPU work (syncpoint
-    /// increments, reference counts, cache invalidations).
-    void NoteVisibilityPoint() {
-        last_memory_write_position = write_position;
-        if (ranges_enabled) {
-            last_visibility_position = write_position;
-        } else {
-            last_untracked_write_position = write_position;
+        slot = {granule, write_position};
+        // Per word: Switch 2 packs semaphores tightly, so one granule holds several.
+        for (u64 word = addr >> 2; word <= (addr + size - 1) >> 2; ++word) {
+            const bool known = payload && word == addr >> 2;
+            word_writes[WordSlot(word)] = {word, write_position, known ? *payload : 0, known};
         }
-    }
-    /// For the front's macro memory reads (MME DMA): waits until the back executed the methods
-    /// that write memory in command order (memory_write_mask, NoteMemoryWrite), the compute and
-    /// copy work and the work before the last host-level wait, all sent so far.
-    bool WaitForMemoryWriters(DrainSite site);
-    /// EDEN_NX2_DMA_RANGES: as WaitForMemoryWriters for a read of [begin, end), waiting only for
-    /// the range-tracked writes that overlap it, untracked memory writes, and, when `gpu_pages`
-    /// (the read touches pages the GPU wrote, or pages not yet seen clean), compute, copy and the
-    /// work before the last host-level wait or visibility point.
-    bool WaitForMemoryWritersIn(GPUVAddr begin, GPUVAddr end, bool gpu_pages, DrainSite site);
-
-    /// Counters for the EDEN_NX2_DMA_RANGES report (front thread).
-    struct RangeStats {
-        u64 reads{};
-        u64 waited{};
-        u64 old_would_wait{};
-        u64 by_range{};
-        u64 by_untracked{};
-        u64 by_gpu_pages{};
-        u64 trusted_list_entries{};
-    };
-    RangeStats range_stats;
-
-    static constexpr size_t SemSlot(u64 addr) noexcept {
-        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10) ^ (addr >> 18)) & 63U);
-    }
-    void NoteSemaphoreWrite(u64 addr) noexcept {
-        sem_write_positions[SemSlot(addr)] = write_position;
         last_release_position = write_position;
+    }
+    /// The value a release still queued for the back will store at `addr`, when it is the last
+    /// write sent to that word, its value is known and no compute or copy work (which could
+    /// also write there) was sent after it. The back runs it before anything sent later, so an
+    /// acquire it meets needs no wait.
+    enum class ReleaseMiss : u8 { None, NoWrite, OtherAddress, UnknownValue, WriterAfter, Ran };
+    struct ReleaseLookup {
+        std::optional<u32> value;
+        ReleaseMiss miss{};
+        u64 position{}; ///< Where the release is queued (when value is set)
+    };
+    [[nodiscard]] ReleaseLookup QueuedRelease(u64 addr) const noexcept {
+        if ((addr & 3) != 0) {
+            return {std::nullopt, ReleaseMiss::OtherAddress};
+        }
+        const WordWrite& slot = word_writes[WordSlot(addr >> 2)];
+        if (slot.word != addr >> 2) {
+            return {std::nullopt, ReleaseMiss::NoWrite};
+        }
+        if (!slot.known) {
+            return {std::nullopt, ReleaseMiss::UnknownValue};
+        }
+        if (slot.position < last_writer_position) {
+            return {std::nullopt, ReleaseMiss::WriterAfter};
+        }
+        if (slot.position <= consumed.load(std::memory_order_acquire)) {
+            return {std::nullopt, ReleaseMiss::Ran};
+        }
+        return {slot.payload, ReleaseMiss::None, slot.position};
+    }
+    /// An acquire went on without waiting because the release queued at `position` meets it.
+    /// The guest takes the acquire to mean the GPU work before that release is done, so the
+    /// front's own reads of GPU-written memory (macro DMA reads, GPU-written command lists)
+    /// wait for the back to reach it: a 3D report release is sent after the work it guards, and
+    /// reading ahead of that work made Ocarina of Time's fountain flowers flicker.
+    /// EDEN_NX2_PREDICT_SYNC=0 goes on without that wait, as before.
+    void NotePredictedRelease(u64 position) noexcept {
+        if (PredictSyncEnabled()) {
+            predicted_release_position = std::max(predicted_release_position, position);
+            last_sync_position = std::max(last_sync_position, position);
+        }
+    }
+    /// Waits until the back ran the releases acquires were predicted to be met by.
+    bool WaitForPredictedReleases(DrainSite site) {
+        return WaitFor(std::min(predicted_release_position, write_position), site);
+    }
+    static bool PredictSyncEnabled() noexcept {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_PREDICT_SYNC");
+            return !(value && value[0] == '0');
+        }();
+        return enabled;
     }
     void NoteAnyRelease() noexcept {
         last_release_position = write_position;
@@ -294,71 +414,41 @@ public:
     [[nodiscard]] u64 LastReleasePosition() const noexcept {
         return last_release_position;
     }
-    bool WaitForSemaphore(u64 addr, DrainSite site = DrainSite::Acquire) {
-        return WaitFor(sem_write_positions[SemSlot(addr)], site);
-    }
-private:
-    struct QueuedRelease {
-        GPUVAddr address{};
-        u32 payload{};
-        u64 position{};
-    };
-    std::array<QueuedRelease, 64> queued_releases{};
-    size_t queued_release_head{};
-
-    enum class NextWrite : u8 { None, Range, Visibility };
-    struct RangeWrite {
-        GPUVAddr begin;
-        GPUVAddr end;
-        u64 position;
-    };
-    static constexpr size_t MaxRangeWrites = 128;
-
-    void NoteMaskedWrite(const Tegra::Engines::EngineInterface* engine, u32 method) {
-        last_memory_write_position = write_position;
-        if (!ranges_enabled) {
-            return;
-        }
-        switch (next_write_kind) {
-        case NextWrite::Range:
-            RecordRange(next_range_begin, next_range_end);
-            break;
-        case NextWrite::Visibility:
-            last_visibility_position = write_position;
-            break;
-        case NextWrite::None:
-            if (engine->writer_work_mask[method]) {
-                last_visibility_position = write_position;
-            } else {
-                last_untracked_write_position = write_position;
+    /// Waits for the queued semaphore and report writes to [addr, addr + size).
+    bool WaitForSemaphore(u64 addr, DrainSite site = DrainSite::Acquire, u64 size = 4) {
+        u64 target = sem_evicted_position;
+        for (u64 granule = addr >> 4; granule <= (addr + size - 1) >> 4; ++granule) {
+            const SemWrite& slot = sem_writes[SemSlot(granule)];
+            if (slot.granule == granule) {
+                target = std::max(target, slot.position);
             }
-            break;
         }
-        next_write_kind = NextWrite::None;
+        return WaitFor(std::min(target, write_position), site);
     }
-    void RecordRange(GPUVAddr begin, GPUVAddr end);
 
-    static inline bool ranges_enabled{};
-    static inline bool list_trust_enabled{};
-    std::array<RangeWrite, MaxRangeWrites> range_writes{};
-    size_t range_count{};
-    size_t range_head{};
-    GPUVAddr next_range_begin{};
-    GPUVAddr next_range_end{};
-    NextWrite next_write_kind{};
-    u64 last_untracked_write_position{};
-    u64 last_visibility_position{};
-
+private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Pairs,  ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr u64 Sink = 1 << 7;   ///< Method: into the method sink, tagged (SinkMethod)
+
+    // Read when the split first starts (MaybeStart), after main() applied nx2_switches.txt: a
+    // static initialiser would run before it.
+    static inline bool macro_sink{};
+    static inline bool compute_sink{};
+    static inline bool ring_pairs{};
+    static constexpr u32 MaxPairs = 4096;
+
+    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+    std::unordered_set<u64> report_pages;      ///< Front: 4 KiB pages reports and releases wrote
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -372,6 +462,7 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        pairs_header = nullptr; // What follows ends the open Pairs block
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -406,15 +497,50 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    static constexpr u32 PendingWriteWords = 8;
+    struct PendingWrite {
+        u64 begin;
+        u64 end;
+        u64 position;
+        u32 words; ///< Known words from begin, or 0 (unknown contents)
+        const char* what;
+        std::array<u32, PendingWriteWords> data;
+    };
+    std::array<PendingWrite, 8192> pending_writes{};
+    u64 pending_write_count{};
     u64 last_sync_position{};
-    u64 last_memory_write_position{};
     u64 last_release_position{};
-    std::array<u64, 64> sem_write_positions{};
+    u64 predicted_release_position{};
+    static constexpr size_t SemSlots = 1024;
+    struct SemWrite {
+        u64 granule{~u64{0}};
+        u64 position{};
+    };
+    std::array<SemWrite, SemSlots> sem_writes{};
+    static constexpr size_t WordSlots = 4096;
+    static constexpr size_t WordSlot(u64 word) noexcept {
+        return static_cast<size_t>((word ^ (word >> 12) ^ (word >> 24)) & (WordSlots - 1));
+    }
+    struct WordWrite {
+        u64 word{~u64{0}};
+        u64 position{};
+        u32 payload{};
+        bool known{};
+    };
+    std::array<WordWrite, WordSlots> word_writes{};
+    u64 sem_evicted_position{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The open Pairs block's head (PairWrite), and its count.
+    u64* pairs_header{};
+    u32 pairs_count{};
+    std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
+    std::chrono::steady_clock::time_point batched_since{};
+    u32 publishes{};
+    void ReportBatched();
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

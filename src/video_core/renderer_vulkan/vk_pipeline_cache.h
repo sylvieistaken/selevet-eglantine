@@ -12,10 +12,10 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
-#include <future>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -35,7 +35,6 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
-#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 
@@ -111,6 +110,11 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
+    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
+    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
+    std::vector<u64> mapped_pointers;
+    u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -167,42 +171,22 @@ private:
         std::chrono::steady_clock::time_point last_log{};
     } clean;
 
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
-
-    /// A graphics pipeline translated on a translation worker, with the environments it was
-    /// translated from (stored in the disk cache once the GPU thread takes it).
-    struct TranslatedGraphics {
-        std::unique_ptr<GraphicsPipeline> pipeline;
-        std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram> envs;
-    };
-
-    /// Whether the current Switch 2 draw may be skipped while its pipeline builds (scene
-    /// geometry, not a full screen pass). EDEN_NX2_ASYNC_SKIP=0 waits for every pipeline.
-    [[nodiscard]] bool CanSkipNativeDraw() const;
-    /// How long a native draw may still wait for its pipeline before it is skipped.
-    [[nodiscard]] std::chrono::microseconds NativeWaitAllowance() const;
-    /// Counts the time a native draw spent waiting since `start` against the window's budget.
-    void NoteNativeWait(std::chrono::steady_clock::time_point start) const;
-    mutable std::chrono::steady_clock::time_point native_wait_window{};
-    mutable std::chrono::microseconds native_wait_spent{};
-
-    /// Queues the translation of graphics_key's pipeline (native programs, environments detached
-    /// from the 3D engine) on translation_workers. False when it has to be built here.
-    bool QueueGraphicsTranslation();
-
-    /// Stores a new pipeline in the disk cache, as CreateGraphicsPipeline() does after building.
-    void StoreGraphicsPipeline(const GraphicsPipeline& pipeline, const GraphicsPipelineCacheKey& key,
-                               std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>&& envs);
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel);
 
+    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+
+    /// Translates the current compute program, binding the pointers in keep_pointers whatever
+    /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
-                                                     const ShaderInfo* shader);
+                                                    const ShaderInfo* shader,
+                                                    std::span<const u64> keep_pointers = {});
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
@@ -228,9 +212,11 @@ private:
     TextureCache& texture_cache;
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
+    /// What is left of this frame's Bounded wait budget for unbuilt native pipelines, and the
+    /// time spent waiting since the last log line.
+    s64 native_wait_budget_us{};
+    s64 native_wait_used_us{};
     bool use_vulkan_pipeline_cache{};
-    bool oot_visual_workaround{};
-    u64 visual_workaround_title{};
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
@@ -242,6 +228,9 @@ private:
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
+    /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
+    /// them (tick, pipeline)
+    std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
@@ -268,16 +257,27 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
-    size_t num_pipeline_workers;
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
-    PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 
-    /// Pipelines being translated on translation_workers, by key.
-    ::Common::unordered_map<GraphicsPipelineCacheKey, std::future<TranslatedGraphics>> pending_graphics;
-    /// Declared last so it is destroyed first: its threads use the members above.
-    Common::ThreadWorker translation_workers;
+    /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background
+    /// threads once the game runs, so a draw that needs one finds it built instead of translating
+    /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
+    std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key);
+    void StopBackgroundPipelines();
+    std::mutex background_mutex;
+    /// Built and not yet asked for by a draw.
+    std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;
+    /// Keys the GPU thread built itself meanwhile: their background build is skipped or dropped.
+    std::unordered_set<GraphicsPipelineCacheKey> background_claimed;
+    std::atomic_bool background_active{};
+    std::atomic_bool background_stop{};
+    std::atomic<size_t> background_left{};
+    size_t background_taken{}; ///< Under background_mutex
+    std::chrono::steady_clock::time_point background_start{};
+    /// Last: destroyed (its threads joined) before the state above.
+    std::unique_ptr<Common::ThreadWorker> background_workers;
 };
 
 } // namespace Vulkan

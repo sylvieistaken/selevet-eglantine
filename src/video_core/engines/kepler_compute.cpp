@@ -9,11 +9,8 @@
 #include <bit>
 #include <bitset>
 #include <cstdlib>
-#include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
-#include <vector>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -53,11 +50,6 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
                      fmt::ptr(this), memory_manager.GetID());
         };
     }
-    // Register writes and dispatches: shader work (storage writes mark their pages GPU-written).
-    // The inline upload (exec_upload, data_upload) writes memory directly.
-    writer_work_mask.set();
-    writer_work_mask[KEPLER_COMPUTE_REG_INDEX(exec_upload)] = false;
-    writer_work_mask[KEPLER_COMPUTE_REG_INDEX(data_upload)] = false;
     execution_mask.reset();
     execution_mask[KEPLER_COMPUTE_REG_INDEX(exec_upload)] = true;
     execution_mask[KEPLER_COMPUTE_REG_INDEX(data_upload)] = true;
@@ -87,11 +79,33 @@ void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 
 void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
+        if ((method & SplitPlainTag) != 0) {
+            // GpuSplit::SinkMethod (EDEN_NX2_COMPUTE_SINK): as CallMethod's native plain path.
+            method &= ~SplitPlainTag;
+            native_registers[method] = value;
+        }
         if (method < Regs::NUM_REGS) {
             regs.reg_array[method] = value;
         }
     }
     method_sink.clear();
+}
+
+void KeplerCompute::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
+    // EDEN_NX2_RING_PAIRS: native plain writes from the split's front (FrontPlainWrite), stored
+    // as CallMethod's native plain path stores them.
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(pairs[i] & 0xffff);
+        const u32 value = static_cast<u32>(pairs[i] >> 32);
+        if (method < native_plain_methods.size()) [[likely]] {
+            native_registers[method] = value;
+            if (method < Regs::NUM_REGS) {
+                regs.reg_array[method] = value;
+            }
+        } else {
+            CallMethod(system, method, value, true);
+        }
+    }
 }
 
 // SET_REPORT_SEMAPHORE_A-D (0x6c0-0x6c3): address high/low, payload, then operation in bits 1:0
@@ -594,19 +608,6 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         static std::unordered_set<std::string> logged;
         if (logged.insert(error.what()).second) {
             LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
-            // EDEN_NX2_SHADER_DUMP: keep the rejected program's code (the dump of translated
-            // programs only sees the ones that lowered), 128 KiB from its start.
-            if (const char* const dump = std::getenv("EDEN_NX2_SHADER_DUMP"); dump && *dump) {
-                const GPUVAddr program = regs.code_loc.Address() + launch_description.program_start;
-                std::vector<u8> code(128 * 1024);
-                memory_manager.ReadBlockUnsafe(program, code.data(), code.size());
-                const auto path = std::filesystem::path{dump} /
-                                  fmt::format("rejected-cs-{:x}.bin", program);
-                if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
-                    std::fwrite(code.data(), 1, code.size(), file);
-                    std::fclose(file);
-                }
-            }
         }
         dispatched = false;
         if (dlss_chain.active) {
@@ -614,8 +615,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         } else if (std::string_view{error.what()}.find("matrix multiply") !=
                    std::string_view::npos) {
             DescribeNativeResources(qmd);
-            // The console runs this on tensor cores; stand in with a plain upscale of its input.
-            return UpscaleInsteadOfNativeProgram();
+            LOG_ERROR(HW_GPU, "Native tensor dispatch is unsupported; no validated replacement was available");
         }
     }
     if (dlss_chain.output_pass) {
@@ -787,7 +787,7 @@ void KeplerCompute::CheckDlssNetwork() {
                 probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
 }
 
-// Tells the Graphics tab what draws the game's DLSS evaluation, when that changes.
+// Logs what draws the game's DLSS evaluation, when that changes.
 void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker) {
     using VideoCore::GameDlssReason;
     using VideoCore::GameDlssState;
@@ -821,7 +821,6 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
                  VideoCore::GameDlssReasonText(shown.reason));
     }
     dlss_chain.status = shown;
-    VideoCore::SetGameDlssStatus(shown);
 }
 
 // Ends this frame's DLSS evaluation at its output pass: either the network's own result stays,
@@ -878,277 +877,6 @@ bool KeplerCompute::FinishDlssEvaluation() {
         return false;
     }
     return TryFireEmblemUpscale();
-}
-
-
-bool KeplerCompute::EmulatesNativeTensorPrograms() const {
-    // Donkey Kong Bananza's programs must run: rejected, they write nothing and the screen is
-    // purple from its mode select on.
-    constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
-    return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId ||
-           rasterizer->EmulatesNativeTensorPrograms();
-}
-
-// Title 4's upscaler reads the tonemapped frame through the texture handle at cbuf0+0x90 and
-// writes the output resolution image through the surface handle at cbuf0+0xa0 (from its
-// TLD/SUST operands). Kirby Air Riders' reads a 2048x1152 image at cbuf0+0x80 and writes a
-// 2560x1440 one at +0x90; Fire Emblem: Fortune's Weave's DLSS network ends with a pass that reads
-// the input colour through cbuf0+0x328 and writes the DLSS output through cbuf0+0x348 (B10G11R11;
-// 720p to 1440p docked). Blit one to the other with bilinear filtering when both are plain 2D
-// images of the same format and the output is larger: title 4's slots first, then Fortune's
-// Weave's, else the first two handles in cbuf0+0x80..0x11c that form such a pair.
-bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
-    const auto& cbuf = launch_description.const_buffer_config[0];
-    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
-    const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
-        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
-        if (tic_index > regs.tic.limit) return std::nullopt;
-        return GetTICEntry(tic_index);
-    };
-    const auto upscale_pair = [](const std::optional<Texture::TICEntry>& from,
-                                 const std::optional<Texture::TICEntry>& to) {
-        return from && to && from->format == to->format && from->Address() != 0 &&
-               to->Address() != 0 && to->Width() > from->Width() && from->IsBlockLinear() &&
-               to->IsBlockLinear();
-    };
-    std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
-    bool fortunes_weave = false;
-    if (!upscale_pair(input, output)) {
-        input = image(0x328);
-        output = image(0x348);
-        fortunes_weave = upscale_pair(input, output);
-    }
-    bool rgb9e5_pair = false;
-    if (!upscale_pair(input, output)) {
-        input.reset();
-        output.reset();
-        // Ocarina of Time's gameplay network reads the frame packed as RGB9E5, each channel the
-        // square root of the tonemapped value, and writes a B10G11R11 image at least as wide. Its constant buffer keeps stale handles (a bloom level
-        // at +0xa0) that the scan below pairs with the output, so this pair goes first: the widest
-        // B10G11R11 image when nothing in the pass is wider, from the widest RGB9E5 image of the
-        // same aspect at most 4x narrower.
-        const u32 limit = (std::min)(cbuf.size.Value(), 0x200U);
-        u32 widest = 0;
-        for (u32 offset = 0; offset + 4 <= limit; offset += 4) {
-            const auto tic = memory_manager.Read<u32>(cbuf_address + offset) != 0 ? image(offset)
-                                                                                     : std::nullopt;
-            if (!tic || tic->Address() == 0 || !tic->IsBlockLinear()) continue;
-            widest = (std::max)(widest, tic->Width());
-            if (tic->format == Texture::TextureFormat::B10G11R11 &&
-                (!output || tic->Width() > output->Width())) {
-                output = tic;
-            }
-            if (tic->format == Texture::TextureFormat::E5B9G9R9 &&
-                (!input || tic->Width() > input->Width())) {
-                input = tic;
-            }
-        }
-        rgb9e5_pair = [&] {
-            if (!input || !output || output->Width() != widest || input->Width() > widest ||
-                4 * input->Width() < widest) {
-                return false;
-            }
-            const u64 cross_a = u64{input->Width()} * output->Height();
-            const u64 cross_b = u64{output->Width()} * input->Height();
-            return (std::max)(cross_a, cross_b) - (std::min)(cross_a, cross_b) <= cross_b / 50;
-        }();
-        if (!rgb9e5_pair) {
-            input.reset();
-            output.reset();
-        }
-    }
-    if (!input) {
-        for (u32 first = 0x80; first < 0x120 && !input; first += 4) {
-            const auto from = memory_manager.Read<u32>(cbuf_address + first) != 0 ? image(first)
-                                                                                    : std::nullopt;
-            for (u32 second = first + 4; from && second < 0x120; second += 4) {
-                if (memory_manager.Read<u32>(cbuf_address + second) == 0) continue;
-                const auto to = image(second);
-                if (upscale_pair(from, to)) {
-                    input = from;
-                    output = to;
-                    break;
-                }
-            }
-        }
-    }
-    if (!input || !output)
-        return false;
-    using RTFormat = Tegra::RenderTargetFormat;
-    const auto rt_format = [](Texture::TextureFormat format) -> std::optional<RTFormat> {
-        switch (format) {
-        case Texture::TextureFormat::A2B10G10R10: return RTFormat::A2B10G10R10_UNORM;
-        case Texture::TextureFormat::A8B8G8R8: return RTFormat::A8B8G8R8_UNORM;
-        case Texture::TextureFormat::B10G11R11: return RTFormat::B10G11R11_FLOAT;
-        case Texture::TextureFormat::R16G16B16A16: return RTFormat::R16G16B16A16_FLOAT;
-        case Texture::TextureFormat::E5B9G9R9: return RTFormat::E5B9G9R9_FLOAT;
-        default: return std::nullopt;
-        }
-    };
-    if (!rt_format(input->format) || !rt_format(output->format))
-        return false;
-    const auto surface = [&](const Texture::TICEntry& tic) {
-        Fermi2D::Surface result{};
-        result.format = *rt_format(tic.format);
-        result.linear = Fermi2D::MemoryLayout::BlockLinear;
-        result.block_width.Assign(tic.block_width);
-        result.block_height.Assign(tic.block_height);
-        result.block_depth.Assign(tic.block_depth);
-        result.depth = 1;
-        result.width = tic.Width();
-        result.height = tic.Height();
-        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
-        result.addr_lower = static_cast<u32>(tic.Address());
-        return result;
-    };
-    // Title 4's program ends by decoding its result from sRGB to linear (the 0.04045 threshold
-    // and the 2.4 exponent as half-precision immediates of HSETP2 and HMUL2). The copy of its
-    // sRGB input left the frame gamma-encoded twice, washed out: decode in the copy when the
-    // program does.
-    static std::unordered_map<GPUVAddr, bool> decodes_srgb;
-    const GPUVAddr program = regs.code_loc.Address();
-    const auto [known, inserted] = decodes_srgb.try_emplace(program, false);
-    if (inserted) {
-        bool threshold = false, exponent = false;
-        std::array<u32, 0x400> block{};
-        for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent); offset += sizeof(block)) {
-            if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
-            memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
-            for (size_t word = 0; word < block.size(); word += 4) {
-                const u32 opcode = block[word] & 0xfff;
-                threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
-                exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
-            }
-        }
-        known->second = threshold && exponent;
-        LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
-                 known->second ? "decodes sRGB like the program" : "plain copy");
-    }
-    const Fermi2D::Config config{
-        .operation = rgb9e5_pair      ? Fermi2D::Operation::SrcCopySquare
-                     : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
-                                     : Fermi2D::Operation::SrcCopy,
-        .filter = Fermi2D::Filter::Bilinear,
-        .must_accelerate = true,
-        .dst_x0 = 0,
-        .dst_y0 = 0,
-        .dst_x1 = static_cast<s32>(output->Width()),
-        .dst_y1 = static_cast<s32>(output->Height()),
-        .src_x0 = 0,
-        .src_y0 = 0,
-        .src_x1 = static_cast<s32>(input->Width()),
-        .src_y1 = static_cast<s32>(input->Height()),
-    };
-    // Debug: does the input hold anything? Download it once and count non-zero words.
-    static const u32 sample_at = [] {
-        const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
-        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 20U;
-    }();
-    if (static u32 sampled{}; sampled++ == sample_at) {
-        const auto sample = [&](const Texture::TICEntry& tic) {
-            const u64 size = u64{tic.Width()} * tic.Height() * 4;
-            if (const auto device = memory_manager.GpuToCpuAddress(tic.Address())) {
-                rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
-            }
-            u32 nonzero{}, samples{};
-            u64 sum{};
-            for (u64 offset = 0; offset < size; offset += 4096 + 4) {
-                const u32 word = memory_manager.Read<u32>(tic.Address() + offset);
-                ++samples;
-                nonzero += word != 0;
-                sum += (word & 0x3ff) + ((word >> 10) & 0x3ff) + ((word >> 20) & 0x3ff);
-            }
-            LOG_INFO(HW_GPU, "Upscale fallback image {:#x}: {}/{} sampled words non-zero, mean channel {}",
-                     tic.Address(), nonzero, samples, samples ? sum / (samples * 3) : 0);
-        };
-        sample(*input);
-        sample(*output);
-        // Every 2560x1440 target the in-game passes draw to (from EDEN_NX2_RT_TRACE).
-        for (const GPUVAddr address : {0x8116a03000ULL, 0x8117ae5000ULL, 0x8114b62000ULL,
-                                       0x8115a63000ULL, 0x8117904000ULL, 0x8114a02000ULL}) {
-            Texture::TICEntry fake = *input;
-            const u64 size = 2560ULL * 1440 * 4;
-            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
-            }
-            u32 nonzero{}, samples{}, distinct{};
-            u32 last{};
-            for (u64 offset = 0; offset < size; offset += 4096 + 4) {
-                const u32 word = memory_manager.Read<u32>(address + offset);
-                ++samples;
-                nonzero += word != 0;
-                distinct += word != last;
-                last = word;
-            }
-            LOG_INFO(HW_GPU, "Upscale fallback target {:#x}: {}/{} non-zero, {} changes", address, nonzero,
-                     samples, distinct);
-            (void)fake;
-        }
-    }
-    auto source = surface(*input);
-    // EDEN_NX2_UPSCALE_SOURCE=<gpu address>: blit from another same-sized image (debug aid).
-    if (static const u64 override_source = [] {
-            const char* value = std::getenv("EDEN_NX2_UPSCALE_SOURCE");
-            return value ? std::strtoull(value, nullptr, 16) : 0ULL;
-        }();
-        override_source != 0) {
-        source.addr_upper = static_cast<u32>(override_source >> 32);
-        source.addr_lower = static_cast<u32>(override_source);
-        if (const char* value = std::getenv("EDEN_NX2_UPSCALE_SOURCE_FORMAT")) {
-            source.format = static_cast<RTFormat>(std::strtoul(value, nullptr, 16));
-        }
-    }
-    // Fortune's Weave: a temporal upscale along its motion vectors that undoes this frame's camera
-    // jitter (both from the frame's first DLSS pass) and accumulates the frames as DLSS would.
-    // EDEN_NX2_TEMPORAL_UPSCALE=0 blits instead.
-    const auto upscale_temporally = [&] {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_NX2_TEMPORAL_UPSCALE");
-            return value == nullptr || std::string_view{value} != "0";
-        }();
-        if (!fortunes_weave || !enabled || !dlss_motion_vectors ||
-            dlss_motion_color != input->Address())
-            return false;
-        Fermi2D::Surface motion = surface(*dlss_motion_vectors);
-        motion.format = RTFormat::R16G16_FLOAT;
-        return rasterizer->AccelerateTemporalUpscale(source, surface(*output), motion,
-                                                     dlss_depth ? &*dlss_depth : nullptr,
-                                                     dlss_jitter, {1.0f, 1.0f});
-    };
-    const bool done = upscale_temporally() ||
-                      rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
-    if (static u32 checked{}; checked++ == sample_at) {
-        const u64 size = u64{output->Width()} * output->Height() * 4;
-        if (const auto device = memory_manager.GpuToCpuAddress(output->Address())) {
-            rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
-        }
-        u32 nonzero{}, samples{}, changes{}, last{};
-        for (u64 offset = 0; offset < size; offset += 4096 + 4) {
-            const u32 word = memory_manager.Read<u32>(output->Address() + offset);
-            ++samples;
-            nonzero += word != 0;
-            changes += word != last;
-            last = word;
-        }
-        LOG_INFO(HW_GPU, "Upscale fallback output after blit: {}/{} non-zero, {} changes", nonzero, samples,
-                 changes);
-    }
-    // Debug: trace the draws that follow one upscale (EDEN_NX2_RT_TRACE_AFTER_UPSCALE).
-    static const u32 trace_at = [] {
-        const char* value = std::getenv("EDEN_NX2_TRACE_AFTER_UPSCALE");
-        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 30U;
-    }();
-    if (static u32 count{}; ++count == trace_at) g_nx2_trace_draws_after_upscale = 40;
-    static u32 logged{};
-    if (logged++ < 4) {
-        LOG_INFO(HW_GPU, "Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",
-                 input->Address(), input->Width(), input->Height(), input->block_width.Value(),
-                 input->block_height.Value(), input->block_depth.Value(), output->Address(),
-                 output->Width(), output->Height(), output->block_width.Value(),
-                 output->block_height.Value(), output->block_depth.Value(), output->max_mip_level.Value(),
-                 done ? "blitted" : "not accelerated");
-    }
-    return done;
 }
 
 // Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
@@ -1404,7 +1132,23 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// EDEN_NX2_COMPUTE_SINK: plain registers (native_plain_methods) this front sent a write to.
+    /// The back stored that value in both native_registers and regs, so `registers` holds what
+    /// both hold and a later write of the same value can be dropped.
+    std::bitset<0xe00> plain_sent;
+    u64 calls{}; ///< Macro calls, for EDEN_NX2_SPLIT_VERIFY
 };
+
+namespace {
+
+// EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
+// front's compute registers with the back's (logs and resynchronizes differences).
+bool ComputeFrontVerifyEnabled() {
+    static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
+    return verify;
+}
+
+} // Anonymous namespace
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
@@ -1431,6 +1175,21 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     }
     fs.registers[method] = argument;
     switch (method) {
+    case 0x107:
+        // Keeps the copy exact (front macros read it; EDEN_NX2_COMPUTE_SINK relies on it): an
+        // inline QMD whose destination is mapped launches through ProcessNativeMethod(0xb0, 3) on
+        // the back, which leaves 3 in 0xb0 (0xad is restored). Without this the copy kept the
+        // last 0xb0 the front sent.
+        {
+            const GPUVAddr address =
+                ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+            const u32 control = fs.registers[0xa7];
+            if (memory_manager.IsFullyMappedRange(address, 256) &&
+                ((control & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
+                fs.registers[0xb0] = 3;
+            }
+        }
+        break;
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
         break;
@@ -1491,8 +1250,36 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         }
         return;
     }
+    if (FrontPlainWrite(split, fs, method, argument)) {
+        return;
+    }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+}
+
+bool KeplerCompute::FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                    u32 argument) {
+    // EDEN_NX2_COMPUTE_SINK: a write that only stores its value (CallMethod's native_plain_methods
+    // path, which writes native_registers and regs) is dropped when both hold it already, else
+    // sunk on the back and applied before the engine's next other write. The segment does not
+    // matter: only data_upload reads current_dma_segment, and it is never plain.
+    if (!VideoCommon::GpuSplit::ComputeSink() || method >= native_plain_methods.size() ||
+        !native_plain_methods[method]) {
+        return false;
+    }
+    if (fs.plain_sent[method] && fs.registers[method] == argument) {
+        split.CountBatched(VideoCommon::GpuSplit::Batched::ComputeSame);
+        return true;
+    }
+    fs.plain_sent[method] = true;
+    fs.registers[method] = argument; // All FrontApply does for a plain register
+    if (VideoCommon::GpuSplit::RingPairs()) {
+        split.PairWrite(this, method, argument); // ApplyPairs
+    } else {
+        split.SinkMethod(this, method, argument);
+    }
+    split.CountBatched(VideoCommon::GpuSplit::Batched::ComputeSunk);
+    return true;
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1530,6 +1317,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (address >= 0xe00) {
             return false;
         }
+        if (FrontPlainWrite(split, fs, address, value)) {
+            return true;
+        }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
         return true;
@@ -1551,6 +1341,50 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                   start, result.consumed, result.error);
     }
     fs.parameters.clear();
+    if (VideoCommon::GpuSplit::ComputeSink() && ComputeFrontVerifyEnabled() &&
+        (++fs.calls & 4095) == 0) [[unlikely]] {
+        FrontVerify(split, fs);
+    }
+}
+
+void KeplerCompute::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+    split.Drain(VideoCommon::DrainSite::FrontVerify);
+    static u64 checks{};
+    static u64 differences{};
+    ++checks;
+    // Writes the back still holds in its method sink count as done (SinkMethod's are tagged).
+    std::array<u32, 0x1000> expected = native_registers;
+    std::array<u32, Regs::NUM_REGS> expected_regs;
+    std::memcpy(expected_regs.data(), regs.reg_array.data(), sizeof(expected_regs));
+    for (auto [method, value] : method_sink) {
+        if ((method & SplitPlainTag) != 0) {
+            method &= ~SplitPlainTag;
+            expected[method] = value;
+        }
+        if (method < Regs::NUM_REGS) {
+            expected_regs[method] = value;
+        }
+    }
+    for (u32 i = 0; i < 0xe00; ++i) {
+        // Dropped same-value writes rely on regs holding what native_registers holds.
+        const bool regs_differ =
+            fs.plain_sent[i] && i < Regs::NUM_REGS && expected_regs[i] != expected[i];
+        if (fs.registers[i] == expected[i] && !regs_differ) {
+            continue;
+        }
+        if (differences++ < 64) {
+            LOG_WARNING(HW_GPU, "Split front compute register {:#x}: front {:#x}, back {:#x}{}", i,
+                        fs.registers[i], expected[i],
+                        regs_differ ? fmt::format(" (back regs {:#x})", expected_regs[i])
+                                    : std::string{});
+        }
+        fs.registers[i] = expected[i];
+        fs.plain_sent[i] = false;
+    }
+    if ((checks & 63) == 1) {
+        LOG_INFO(HW_GPU, "Split front compute register checks: {} done, {} differences", checks,
+                 differences);
+    }
 }
 
 } // namespace Tegra::Engines

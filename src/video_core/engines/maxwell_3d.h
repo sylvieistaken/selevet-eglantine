@@ -3265,17 +3265,6 @@ public:
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
 
-    /// EDEN_NX2_DRAW_RUNS: a register write about to be applied on the back.
-    void NoteDrawRunsWrite(u32 method, u32 argument);
-
-    /// EDEN_NX2_FAST_DRAW: registers that only parameterize the next draw or the next constant
-    /// buffer bind, or that ProcessMethodCall handles, so writing them doesn't end draw reuse.
-    static bool IsFastDrawParameter(u32 method);
-    /// Methods EDEN_NX2_FAST_DRAW=2 records as light changes (constant buffer data and binds).
-    static bool IsFastDrawDeltaMethod(u32 method);
-    static bool IsFastDrawVertexBuffer(u32 method);
-    void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
-
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
@@ -3292,6 +3281,8 @@ private:
     void ProcessDirtyRegisters(u32 method, u32 argument);
 
     void ConsumeSinkImpl(Core::System& system) override;
+
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
@@ -3400,11 +3391,15 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state);
+    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                              const u32* words, u32 count);
+    /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
+    bool FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                            GPUVAddr source, u32 words);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
-    /// EDEN_NX2_CB_COALESCE: sends the macro's gathered constant buffer data words as one entry.
-    void FlushFrontCbData(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};

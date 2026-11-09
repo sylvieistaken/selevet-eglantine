@@ -72,34 +72,42 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
-// Pages seen not GPU-written at a point where no queued work could have written them first
-// (EDEN_NX2_DMA_RANGES for macro memory reads, EDEN_NX2_LIST_TRUST for command lists). Index 0:
-// macro reads (no compute, copy or earlier draw work queued), 1: command lists (no compute or copy
-// queued). Front thread only.
-inline std::array<std::array<u64, (u64{1} << (36 - Nx2WrittenPageBits)) / 64>, 2> g_nx2_clean_pages{};
-
-[[nodiscard]] inline bool Nx2IsCleanPage(size_t kind, u64 device_address) {
-    const u64 page = device_address >> Nx2WrittenPageBits;
-    if (page >= g_nx2_clean_pages[kind].size() * 64) {
-        return false;
-    }
-    return (g_nx2_clean_pages[kind][page / 64] >> (page % 64)) & 1;
-}
-
-inline void Nx2MarkCleanPage(size_t kind, u64 device_address) {
-    const u64 page = device_address >> Nx2WrittenPageBits;
-    if (page < g_nx2_clean_pages[kind].size() * 64) {
-        g_nx2_clean_pages[kind][page / 64] |= u64{1} << (page % 64);
-    }
-}
-
 /// A new emulation session starts: no page has been written by its GPU yet.
+// Query results written when their host work completes (counter reports): per 16-byte slot
+// hash, how many the back issued and how many completed. Equal counts mean the words in memory
+// are final, so the split's front can read them without draining the back.
+inline constexpr u64 Nx2AsyncReportSlots = u64{1} << 16;
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_issued{};
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_completed{};
+
+[[nodiscard]] inline u64 Nx2AsyncReportSlot(u64 device_address) {
+    return (device_address >> 4) % Nx2AsyncReportSlots;
+}
+
+[[nodiscard]] inline bool Nx2AsyncReportsSettled(u64 device_address, u64 size) {
+    for (u64 slot = device_address >> 4; slot <= (device_address + size - 1) >> 4; ++slot) {
+        const u64 index = slot % Nx2AsyncReportSlots;
+        if (g_nx2_async_reports_completed[index].load(std::memory_order_acquire) !=
+            g_nx2_async_reports_issued[index].load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A new emulation session starts: counter reports the previous one abandoned are not pending.
+inline void Nx2ClearAsyncReports() {
+    for (auto& count : g_nx2_async_reports_issued) {
+        count.store(0, std::memory_order_relaxed);
+    }
+    for (auto& count : g_nx2_async_reports_completed) {
+        count.store(0, std::memory_order_relaxed);
+    }
+}
+
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);
-    }
-    for (auto& kind : g_nx2_clean_pages) {
-        kind.fill(0);
     }
     for (auto& word : g_nx2_command_list_pages) {
         word.store(0, std::memory_order_relaxed);

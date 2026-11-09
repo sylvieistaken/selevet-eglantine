@@ -6,10 +6,7 @@
 
 #include <algorithm>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,13 +19,6 @@
 namespace Vulkan::vk {
 
 namespace {
-
-struct TemplateSize {
-    std::size_t size;
-    VkPipelineBindPoint bind_point;
-};
-std::shared_mutex template_sizes_mutex;
-std::unordered_map<VkDescriptorUpdateTemplate, TemplateSize> template_sizes;
 
 template <typename Func>
 void SortPhysicalDevices(std::vector<VkPhysicalDevice>& devices, const InstanceDispatch& dld,
@@ -130,7 +120,6 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
     X(vkCmdEndRenderPass);
-    X(vkCmdExecuteCommands);
     X(vkCmdEndTransformFeedbackEXT);
     X(vkCmdEndDebugUtilsLabelEXT);
     X(vkCmdFillBuffer);
@@ -179,6 +168,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetColorBlendEquationEXT);
     X(vkCmdResetQueryPool);
     X(vkCmdWriteTimestamp);
+    X(vkCmdWriteBufferMarkerAMD);
     X(vkCmdResolveImage);
     X(vkCreateBuffer);
     X(vkCreateBufferView);
@@ -326,6 +316,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkDestroyDebugUtilsMessengerEXT);
     X(vkDestroyDebugReportCallbackEXT);
     X(vkDestroySurfaceKHR);
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetPhysicalDeviceFeatures2);
     X(vkGetPhysicalDeviceFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
@@ -820,38 +811,10 @@ CommandPool Device::CreateCommandPool(const VkCommandPoolCreateInfo& ci) const {
     return CommandPool(object, handle, *dld);
 }
 
-std::size_t DescriptorUpdateTemplateDataSize(VkDescriptorUpdateTemplate update_template,
-                                             VkPipelineBindPoint& bind_point) {
-    std::shared_lock lock{template_sizes_mutex};
-    const auto it = template_sizes.find(update_template);
-    if (it == template_sizes.end()) {
-        return 0;
-    }
-    bind_point = it->second.bind_point;
-    return it->second.size;
-}
-
 DescriptorUpdateTemplate Device::CreateDescriptorUpdateTemplate(
     const VkDescriptorUpdateTemplateCreateInfo& ci) const {
     VkDescriptorUpdateTemplate object;
     Check(dld->vkCreateDescriptorUpdateTemplate(handle, &ci, nullptr, &object));
-    std::size_t size = 0;
-    for (u32 i = 0; i < ci.descriptorUpdateEntryCount; ++i) {
-        const VkDescriptorUpdateTemplateEntry& entry = ci.pDescriptorUpdateEntries[i];
-        if (entry.descriptorCount != 0) {
-            const std::size_t count = entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
-                                          ? 1
-                                          : entry.descriptorCount;
-            const std::size_t element = entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
-                                            ? entry.descriptorCount
-                                            : entry.stride;
-            size = std::max(size, entry.offset + entry.stride * (count - 1) + element);
-        }
-    }
-    {
-        std::scoped_lock lock{template_sizes_mutex};
-        template_sizes[object] = {size, ci.pipelineBindPoint};
-    }
     return DescriptorUpdateTemplate(object, handle, *dld);
 }
 
@@ -1042,6 +1005,29 @@ std::vector<VkPhysicalDeviceToolProperties> PhysicalDevice::GetPhysicalDeviceToo
     dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, nullptr);
     std::vector<VkPhysicalDeviceToolProperties> properties(num);
     dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, properties.data());
+    return properties;
+}
+
+std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatrixPropertiesKHR()
+    const {
+    if (!dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num, nullptr) !=
+        VK_SUCCESS) {
+        return {};
+    }
+    std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+        num, VkCooperativeMatrixPropertiesKHR{
+                 .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+                 .pNext = nullptr,
+             });
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num,
+                                                               properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    properties.resize(num);
     return properties;
 }
 

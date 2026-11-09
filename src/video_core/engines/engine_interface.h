@@ -43,21 +43,25 @@ public:
         }
     }
 
+    /// GpuSplit::PairWrite blocks (EDEN_NX2_RING_PAIRS): writes that only store a register's
+    /// value, word i = method (bits 0-15) and value (bits 32-63), applied in order after the
+    /// method sink. Engines the split sends pairs to apply them as their sink would.
+    virtual void ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            CallMethod(system, static_cast<u32>(pairs[i] & 0xffff),
+                       static_cast<u32>(pairs[i] >> 32), true);
+        }
+    }
+
+    /// In a method_sink entry: a write the GPU thread split's front found only stores the
+    /// register's value although execution_mask has the register (GpuSplit::SinkMethod).
+    /// Methods are 16-bit.
+    static constexpr u32 SplitPlainTag = 1U << 16;
+
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
-    /// Methods that can write memory in command order (uploads, reports, copies, dispatches):
-    /// the split's front waits for the last one sent before its macros read memory. Draws and
-    /// clears are left out: their writes are visible only after a host-level wait.
-    std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
-        std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
-    /// Of those, methods whose writes are shader or copy work that marks the pages it writes as
-    /// GPU-written once it runs (EDEN_NX2_DMA_RANGES waits for them only on such pages).
-    std::bitset<(std::numeric_limits<u16>::max)()> writer_work_mask{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};
-    /// EDEN_NX2_FAST_DRAW: the engine reports its own changes (Maxwell3D); a method of any other
-    /// engine ends draw reuse.
-    bool reports_fast_draw_breaks{};
 protected:
     virtual void ConsumeSinkImpl(Core::System& system) {
         for (auto [method, value] : method_sink) {

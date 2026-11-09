@@ -244,18 +244,7 @@ add_executable(yuzu
     game/carousel.h game/carousel.cpp
 )
 
-set_target_properties(yuzu PROPERTIES OUTPUT_NAME "selevet")
-
-# Threads made without an explicit size (the shader workers among them) get the executable's
-# stack reserve. 1 MiB overflowed in the SSA pass on FAST Fusion's largest shaders; reserving
-# more costs address space only, pages are committed as a stack grows.
-if (WIN32)
-    if (MSVC OR CXX_CLANG)
-        target_link_options(yuzu PRIVATE "/STACK:16777216")
-    else()
-        target_link_options(yuzu PRIVATE "-Wl,--stack,16777216")
-    endif()
-endif()
+set_target_properties(yuzu PROPERTIES OUTPUT_NAME "nyamu")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
 # startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
@@ -383,7 +372,7 @@ target_sources(yuzu
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-    # Use the supplied Lichii artwork for all macOS generators.
+    # Use the supplied Nyamu artwork for all macOS generators.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
     set(_icons "${_dist}/lichii.icns")
     if (CMAKE_GENERATOR MATCHES "Xcode")

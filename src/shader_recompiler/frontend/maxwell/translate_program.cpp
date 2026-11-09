@@ -7,13 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
-#include <chrono>
 #include <memory>
 #include <optional>
 #include <vector>
 #include <queue>
 
-#include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -92,7 +90,7 @@ void CollectInterpolationInfo(Environment& env, IR::Program& program) {
     }
 }
 
-void AddNVNStorageBuffers(IR::Program& program) {
+void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_info) {
     if (!program.info.uses_global_memory) {
         return;
     }
@@ -131,6 +129,11 @@ void AddNVNStorageBuffers(IR::Program& program) {
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
             continue;
+        }
+        if (descs.size() >= Optimization::StorageBufferLimit(host_info)) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descs.size() + 1,
+                                          Optimization::StorageBufferLimit(host_info));
         }
         descs.push_back({
             .cbuf_index = driver_cbuf,
@@ -363,24 +366,10 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
 
-    // Where a slow translation spends its time (logged when it takes over 100 ms).
-    std::array<std::pair<const char*, double>, 16> pass_ms{};
-    size_t pass_count = 0;
-    auto pass_begin = std::chrono::steady_clock::now();
-    const auto end_pass = [&](const char* name) {
-        const auto now = std::chrono::steady_clock::now();
-        if (pass_count < pass_ms.size()) {
-            pass_ms[pass_count++] = {name, std::chrono::duration<double, std::milli>(now - pass_begin).count()};
-        }
-        pass_begin = now;
-    };
-
     IR::Program program;
     program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
-    end_pass("asl");
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
-    end_pass("blocks");
     program.stage = env.ShaderStage();
     program.local_memory_size = env.LocalMemorySize();
     switch (program.stage) {
@@ -427,7 +416,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 4 && program.mesh.topology != 0) {
+            if (program.mesh.topology != 4) {
                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
                                               program.mesh.topology, shader_a);
             }
@@ -440,7 +429,6 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         break;
     }
     RemoveUnreachableBlocks(program);
-    end_pass("unreachable");
 
     // Replace instructions before the SSA rewrite
     if (!normalized_host_info.support_float64) {
@@ -455,34 +443,26 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (!normalized_host_info.support_conditional_barrier) {
         Optimization::ConditionalBarrierPass(program);
     }
-    end_pass("lower types");
     Optimization::SsaRewritePass(program);
-    end_pass("ssa");
 
     Optimization::ConstantPropagationPass(env, program);
-    end_pass("constants");
 
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
-    end_pass("position");
 
     Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
-    end_pass("storage buffers");
     Optimization::GeometryCompactionPass(program, normalized_host_info);
     Optimization::TexturePass(env, program, normalized_host_info);
-    end_pass("textures");
 
     if (Settings::values.resolution_info.active) {
         Optimization::RescalingPass(program);
     }
     Optimization::DeadCodeEliminationPass(program);
-    end_pass("dead code");
     TightenOutputVertices(program);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(program);
     }
     Optimization::CollectShaderInfoPass(env, program);
-    end_pass("info");
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
@@ -499,24 +479,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::VendorWorkaroundPass(program);
 
     CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
+    AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::LimitSampledTextureArrays(program, normalized_host_info);
-    end_pass("rest");
-    double total = 0;
-    std::string breakdown;
-    for (size_t i = 0; i < pass_count; ++i) {
-        total += pass_ms[i].second;
-        breakdown += fmt::format("{}{} {:.1f}", i ? ", " : "", pass_ms[i].first, pass_ms[i].second);
-    }
-    if (total > 100.0) {
-        LOG_INFO(Shader, "Slow translation ({:.0f} ms, {} blocks): {}", total,
-                 program.blocks.size(), breakdown);
-    }
     return program;
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
-                                    Environment& env_vertex_b) {
+                                    Environment& env_vertex_b, const HostTranslateInfo& host_info) {
     IR::Program result{};
     Optimization::VertexATransformPass(vertex_a);
     Optimization::VertexBTransformPass(vertex_b);
@@ -539,7 +508,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    Optimization::JoinStorageInfo(result.info, vertex_b.info);
+    // The two halves are one stage: their storage buffers share its limit.
+    Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                  Optimization::StorageBufferLimit(host_info));
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

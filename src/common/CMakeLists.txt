@@ -124,10 +124,10 @@ add_library(
     swap.h
     thread.cpp
     thread.h
-    nx2_sample_profile.cpp
-    nx2_sample_profile.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
+    nx2_sample_profile.cpp
+    nx2_sample_profile.h
     adpf.cpp
     adpf.h
     thread_queue_list.h

@@ -63,6 +63,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
     FEATURE(EXT, DescriptorBuffer, DESCRIPTOR_BUFFER, descriptor_buffer)                           \
+    FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY,                               \
+            graphics_pipeline_library)                                                             \
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
@@ -74,9 +76,9 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
-    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
+    FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
@@ -90,6 +92,7 @@ VK_DEFINE_HANDLE(VmaPool)
 
 // Define miscellaneous extensions which may be used by the implementation here.
 #define FOR_EACH_VK_EXTENSION(EXTENSION)                                                           \
+    EXTENSION(AMD, BUFFER_MARKER, buffer_marker)                                                   \
     EXTENSION(EXT, ASTC_DECODE_MODE, astc_decode_mode)                                             \
     EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
@@ -101,6 +104,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(EXT, SHADER_VIEWPORT_INDEX_LAYER, shader_viewport_index_layer)                       \
     EXTENSION(EXT, TOOLING_INFO, tooling_info)                                                     \
     EXTENSION(EXT, VERTEX_ATTRIBUTE_DIVISOR, vertex_attribute_divisor)                             \
+    EXTENSION(KHR, PIPELINE_LIBRARY, pipeline_library)                                             \
     EXTENSION(KHR, CREATE_RENDERPASS_2, create_renderpass2)                                        \
     EXTENSION(KHR, DEPTH_STENCIL_RESOLVE, depth_stencil_resolve)                                   \
     EXTENSION(KHR, DRAW_INDIRECT_COUNT, draw_indirect_count)                                       \
@@ -415,6 +419,7 @@ public:
 #define FN_MAX_LIMIT_LIST \
     FN_MAX_LIMIT_ELEM(ComputeSharedMemorySize) \
     FN_MAX_LIMIT_ELEM(PerStageDescriptorSampledImages) \
+    FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
     FN_MAX_LIMIT_ELEM(PerStageResources) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
@@ -423,8 +428,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
-    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
-    FN_MAX_LIMIT_ELEM(GeometryOutputComponents)
+    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments)
 #define FN_MAX_LIMIT_ELEM(name) \
     u32 GetMax##name() const { return properties.properties.limits.max##name; }
 FN_MAX_LIMIT_LIST
@@ -483,7 +487,7 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if the device supports float16 natively.
     bool IsFloat16Supported() const {
-        return features.shader_float16_int8.shaderFloat16;
+        return float16_math;
     }
 
     /// Returns true if the device can run shaders built against the Vulkan memory model.
@@ -531,19 +535,6 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
     }
 
-    /// AMDVLK's dynamic Shuffle workaround is safe only with a forced 32-lane graphics subgroup.
-    bool NeedsGraphicsSubgroupShuffleWorkaround(VkShaderStageFlagBits stage) const {
-        const auto driver_id = GetDriverID();
-        const bool affected_driver = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                                     driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-                                     driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY;
-        // VUID-VkPipelineShaderStageCreateInfo-pNext-02756 limits task/mesh local sizes to
-        // requiredSubgroupSize * maxComputeWorkgroupSubgroups; allowed sizes can exceed this at 32.
-        return affected_driver && stage != VK_SHADER_STAGE_COMPUTE_BIT &&
-               stage != VK_SHADER_STAGE_TASK_BIT_EXT && stage != VK_SHADER_STAGE_MESH_BIT_EXT &&
-               IsExtSubgroupSizeControlSupported() && IsGuestWarpSizeSupported(stage);
-    }
-
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;
@@ -551,10 +542,6 @@ FN_MAX_LIMIT_LIST
 
     VkShaderStageFlags GetSubgroupSupportedStages() const {
         return properties.subgroup_properties.supportedStages;
-    }
-
-    u32 GetMinSubgroupSize() const {
-        return properties.subgroup_size_control.minSubgroupSize;
     }
 
     u32 GetMaxSubgroupSize() const {
@@ -575,6 +562,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports descriptor buffers.
     bool IsExtDescriptorBufferSupported() const {
         return extensions.descriptor_buffer;
+    }
+
+    /// Pipelines can be built from separately compiled, quickly linked parts (opt-in).
+    bool IsGraphicsPipelineLibraryUsable() const {
+        return extensions.graphics_pipeline_library && extensions.pipeline_library &&
+               properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
     }
 
     /// Returns the descriptor buffer properties of the device.
@@ -677,6 +670,18 @@ FN_MAX_LIMIT_LIST
         return extensions.workgroup_memory_explicit_layout &&
                features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout16BitAccess &&
                features.features.shaderInt16;
+    }
+
+    /// Returns true if the guest's HMMA.16816.F16 can run on the host's cooperative matrices
+    /// (VK_KHR_cooperative_matrix with the same 16x8x16 shape on 16-bit floats, 32-lane subgroups).
+    bool IsCooperativeHmmaSupported() const {
+        return cooperative_hmma_16x8x16;
+    }
+
+    /// Returns true if the guest's HMMA can run through shared memory on 16x16x16 cooperative
+    /// matrices of 16-bit floats, with compute subgroups forced to the guest's 32 lanes.
+    bool IsCooperativeHmma16x16x16Supported() const {
+        return cooperative_hmma_16x16x16;
     }
 
     /// Returns true if the device supports VK_KHR_shader_quad_control.
@@ -977,12 +982,6 @@ FN_MAX_LIMIT_LIST
                features.provoking_vertex.transformFeedbackPreservesProvokingVertex;
     }
 
-    /// Returns true if storage buffer float atomic adds run natively (VK_EXT_shader_atomic_float).
-    bool IsShaderBufferFloat32AtomicAddSupported() const {
-        return extensions.shader_atomic_float &&
-               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
-    }
-
     /// Returns true if the device supports VK_KHR_shader_atomic_int64.
     bool IsExtShaderAtomicInt64Supported() const {
         return extensions.shader_atomic_int64;
@@ -1049,6 +1048,11 @@ FN_MAX_LIMIT_LIST
         return has_broken_parallel_compiling;
     }
 
+    /// Returns true for AMD GCN4 and older (Polaris and earlier) on AMD's own drivers.
+    bool IsAmdLegacyGcn() const {
+        return is_amd_legacy_gcn;
+    }
+
     /// Returns the vendor name reported from Vulkan.
     std::string_view GetVendorName() const {
         return properties.driver.driverName;
@@ -1065,6 +1069,10 @@ FN_MAX_LIMIT_LIST
 
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
+    }
+
+    bool IsAmdBufferMarkerSupported() const {
+        return extensions.buffer_marker;
     }
 
     u64 GetDeviceMemoryUsage() const;
@@ -1322,11 +1330,14 @@ private:
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
 
         VkPhysicalDeviceProperties properties{};
     };
@@ -1343,6 +1354,9 @@ private:
     bool is_blit_depth24_stencil8_supported{}; ///< Support for blitting from and to D24S8.
     bool is_blit_depth32_stencil8_supported{}; ///< Support for blitting from and to D32S8.
     bool is_warp_potentially_bigger{};         ///< Host warp size can be bigger than guest.
+    bool float16_math{};                       ///< Shaders may do float16 arithmetic.
+    bool cooperative_hmma_16x8x16{};           ///< HMMA runs on the guest's matrix shape.
+    bool cooperative_hmma_16x16x16{};          ///< HMMA runs on 16x16x16 matrices.
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
@@ -1350,6 +1364,7 @@ private:
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
+    bool is_amd_legacy_gcn{};                  ///< AMD GCN4 or older on an AMD driver.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -160,6 +161,14 @@ struct GenericElementInfo {
     Id id{};
     u32 first_element{};
     u32 num_components{};
+};
+
+struct CooperativeHmmaTypes {
+    Id float16{};
+    Id float16x2{};
+    Id matrix_a{};
+    Id matrix_b{};
+    Id matrix_c{};
 };
 
 class EmitContext final : public Sirit::Module {
@@ -330,8 +339,6 @@ public:
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
     Id f32_add_cas{};
-    /// A native float atomic add was emitted (its extension and capability are declared).
-    bool uses_native_float_add{};
     Id f16x2_add_cas{};
     Id f16x2_min_cas{};
     Id f16x2_max_cas{};
@@ -349,9 +356,7 @@ public:
     Id write_global_func_u32x4{};
     Id atomic_add_global_func_u32{};
     Id atomic_umax_global_func_u32{};
-    Id atomic_umin_global_func_u32{};
-    Id atomic_smin_global_func_u32{};
-    Id atomic_smax_global_func_u32{};
+    Id atomic_cas_global_func_u32{};
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -370,6 +375,11 @@ public:
     Id frag_depth{};
 
     std::array<Id, 2> software_matrix_functions{};
+    std::optional<CooperativeHmmaTypes> cooperative_hmma; ///< Set when a program lowers HMMA to it
+    /// Set when HMMA runs on 16x16x16 matrices: each 32-lane subgroup owns 384 words of shared
+    /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
+    std::optional<u32> tensor_scratch_word;
+    Id tensor_subgroup_id{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
