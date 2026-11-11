@@ -1869,8 +1869,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                        key, device.GetMaxGeometryOutputComponents());
         }
         Shader::Profile stage_profile{profile};
-        stage_profile.has_broken_spirv_dynamic_subgroup_shuffle =
+        // AMD's compiler crashes on a dynamic-lane shuffle in graphics stages. The replacement loop
+        // covers 32 lanes when the stage can be forced to a 32-lane subgroup, otherwise (Adrenalin
+        // 26.10.1 lists only compute in requiredSubgroupSizeStages) the whole host subgroup.
+        const bool can_force_32_lanes =
             device.NeedsGraphicsSubgroupShuffleWorkaround(MaxwellToVK::ShaderStage(program.stage));
+        stage_profile.has_broken_spirv_dynamic_subgroup_shuffle =
+            can_force_32_lanes || BrokenDynamicSubgroupShuffle(device.GetDriverID());
+        stage_profile.dynamic_subgroup_shuffle_forced_32 = can_force_32_lanes;
         const std::vector<u32> code{EmitSPIRV(stage_profile, runtime_info, program, binding)};
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);

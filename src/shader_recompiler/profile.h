@@ -112,6 +112,9 @@ struct Profile {
     /// OpGroupNonUniformShuffle with a lane computed at run time crashes the pipeline compiler in
     /// graphics stages; compute, task and mesh stages keep it
     bool has_broken_spirv_dynamic_subgroup_shuffle{};
+    /// The stage runs with a forced 32-lane subgroup, so the replacement loop only needs 32 lanes;
+    /// otherwise it covers the whole host subgroup
+    bool dynamic_subgroup_shuffle_forced_32{};
     u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};
